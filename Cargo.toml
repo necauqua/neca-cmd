@@ -1,0 +1,11 @@
+[package]
+name = "neca-cmd"
+version = "0.2.2"
+edition = "2024"
+description = "A simple command tokenizer used by my Twitch chat bot"
+homepage = "https://noit.ing/live"
+authors = ["Anton Bulakh <him@necauq.ua>"]
+license = "MIT"
+
+[dev-dependencies]
+insta = "1.43"
