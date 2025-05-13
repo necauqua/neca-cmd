@@ -183,6 +183,8 @@ fn split_balanced(input: &str, seps: &[char]) -> Vec<String> {
     let mut current = String::new();
     let mut in_string = false;
     let mut brace_depth = 0;
+    let mut paren_depth = 0;
+
     let mut chars = input.chars();
     while let Some(ch) = chars.next() {
         if (in_string || brace_depth != 0) && ch == '\\' {
@@ -196,9 +198,11 @@ fn split_balanced(input: &str, seps: &[char]) -> Vec<String> {
             '"' if brace_depth == 0 => in_string = !in_string,
             '{' if !in_string => brace_depth += 1,
             '}' if !in_string => brace_depth -= 1,
+            '(' if !in_string => paren_depth += 1,
+            ')' if !in_string => paren_depth -= 1,
             _ => {}
         }
-        if !in_string && brace_depth == 0 && seps.contains(&ch) {
+        if !in_string && brace_depth == 0 && paren_depth == 0 && seps.contains(&ch) {
             result.push(std::mem::take(&mut current));
         } else {
             current.push(ch);
@@ -217,7 +221,8 @@ mod tests {
         let message = "Hello, this is left~ and right:.3~ and mouse:123:321~ | and then test~ test2~ and ~nope";
         let parsed = CommandMessage::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"left~ right:".3"~ mouse:123:321~ | test~ test2~ nope~"#); // no test2 hah
+        insta::assert_snapshot!(parsed, @r#"left~ right:".3"~ mouse:123:321~ | test~ test2~ nope~"#);
+        // no test2 hah
     }
 
     #[test]
@@ -278,5 +283,19 @@ mod tests {
         let parsed = CommandMessage::parse("command::second-arg~");
 
         insta::assert_snapshot!(parsed, @"command::\"second-arg\"~");
+    }
+
+    #[test]
+    fn funky() {
+        let parsed = CommandMessage::parse(" test:some-text-with-{ braces and shit }-in-it ");
+
+        insta::assert_snapshot!(parsed, @r#"test:"some-text-with-{ braces and shit }-in-it"~"#);
+    }
+
+    #[test]
+    fn percent_full_arg() {
+        let parsed = CommandMessage::parse(" w:%(1:default) ");
+
+        insta::assert_snapshot!(parsed, @r#"w:"%(1:default)"~"#);
     }
 }
