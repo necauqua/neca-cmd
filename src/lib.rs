@@ -1,106 +1,124 @@
+use compact_str::CompactString;
+use lazy_regex::regex_if;
 use std::{
     collections::VecDeque,
-    fmt::{self, Write},
+    fmt::{self, Display, Write},
 };
 
+pub mod calc;
+pub mod param;
+
+use param::Param;
+
 #[derive(Debug, Clone, Copy)]
-pub enum CommandType {
-    Uwu,
+pub enum Symbol {
+    SuffixTilde,
     Tilde,
     Plus,
-    Normie,
+    Exclam,
     Hash,
-    Huh,
-    Neither,
+    Question,
+    None,
 }
 
-impl CommandType {
+impl Symbol {
     pub fn write_command(&self, f: &mut fmt::Formatter<'_>, command: &str) -> fmt::Result {
-        if matches!(self, Self::Uwu) {
+        if matches!(self, Self::SuffixTilde) {
             f.write_str(command)?;
             return f.write_char('~');
         }
-        match self {
-            Self::Tilde => f.write_char('~')?,
-            Self::Plus => f.write_char('+')?,
-            Self::Normie => f.write_char('!')?,
-            Self::Hash => f.write_char('#')?,
-            Self::Huh => f.write_char('?')?,
-            _ => {}
-        };
+        f.write_str(match self {
+            Self::Tilde => "~",
+            Self::Plus => "+",
+            Self::Exclam => "!",
+            Self::Hash => "#",
+            Self::Question => "?",
+            _ => "",
+        })?;
         f.write_str(command)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct CommandToken {
-    pub tpe: CommandType,
+pub struct Token {
+    pub name: CompactString,
+    pub symbol: Symbol,
+}
+
+impl Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.symbol.write_command(f, &self.name)
+    }
+}
+
+impl Token {
+    pub fn split_inline_number(&self) -> Option<(&str, &str)> {
+        // eh, in this instance regex is a nice oneliner instead of an enormous hand-rolled parser
+        // and the whole inline numbers thing is a hack anyway
+        regex_if!(r#"^(?<name>.*?)(?<n>-?\d+[sk]?)$"#, &*self.name, (name, n))
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct CommandExpr {
-    pub name: String,
-    pub args: VecDeque<String>,
-    pub tpe: CommandType,
+pub struct Command {
+    pub token: Token,
+    pub params: VecDeque<Param>,
 }
 
-impl fmt::Display for CommandExpr {
+impl fmt::Display for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.name)?;
-        for arg in &self.args {
-            f.write_str(":")?;
-            if arg.chars().all(|ch| ch.is_alphanumeric()) {
-                f.write_str(arg)?;
-            } else {
-                write!(f, "{arg:?}")?;
-            }
+        f.write_str(&self.token.name)?;
+        for param in &self.params {
+            write!(f, ":{param}")?;
         }
         f.write_str("~")?;
         Ok(())
     }
 }
 
-impl CommandExpr {
+impl Command {
     pub fn parse(word: &str) -> Option<Self> {
-        let (word, tpe) = (word.strip_suffix('~').map(|w| (w, CommandType::Uwu)))
-            .or(word.strip_prefix('~').map(|w| (w, CommandType::Tilde)))
-            .or(word.strip_prefix('+').map(|w| (w, CommandType::Plus)))
-            .or(word.strip_prefix('!').map(|w| (w, CommandType::Normie)))
-            .or(word.strip_prefix('#').map(|w| (w, CommandType::Hash)))
-            .or(word.strip_prefix('?').map(|w| (w, CommandType::Huh)))
-            .unwrap_or((word, CommandType::Neither));
+        let (word, tpe) = word
+            .strip_suffix('~')
+            .map(|w| (w, Symbol::SuffixTilde))
+            .or(word.strip_prefix('~').map(|w| (w, Symbol::Tilde)))
+            .or(word.strip_prefix('+').map(|w| (w, Symbol::Plus)))
+            .or(word.strip_prefix('!').map(|w| (w, Symbol::Exclam)))
+            .or(word.strip_prefix('#').map(|w| (w, Symbol::Hash)))
+            .or(word.strip_prefix('?').map(|w| (w, Symbol::Question)))
+            .unwrap_or((word, Symbol::None));
 
-        let mut parts = split_balanced(word, &[':']).into_iter();
-        let name = parts.next().unwrap();
+        let mut args = split_balanced(word, &[':']);
+
+        let name = args.pop_front().unwrap();
 
         if name.is_empty() {
             return None;
         }
 
-        let args: VecDeque<_> = parts.map(|s| unwrap_string_literals(&s)).collect();
-
-        // disallow commands ending in :
-        if args.back().is_some_and(|s| s.is_empty()) {
+        // disallow commands ending in `:`, and disallow commands without symbols not containing a single :
+        if args.back().is_some_and(|s| s.is_empty())
+            || matches!(tpe, Symbol::None) && args.is_empty()
+        {
             return None;
         }
 
-        // disallow commands not containing a single :
-        if (matches!(tpe, CommandType::Neither) && args.is_empty()) {
-            return None;
-        }
-
-        Some(Self { name, args, tpe })
+        Some(Self {
+            token: Token { name, symbol: tpe },
+            params: args.iter().map(|arg| Param::parse(arg)).collect(),
+        })
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct CommandMessage {
-    pub parallel: Vec<Vec<CommandExpr>>,
+pub struct Statement {
+    pub original: String,
+    pub parallel: Vec<Vec<Command>>,
     /// True if the message did not contain any non-command non-whitespace text
     pub pure: bool,
 }
 
-impl fmt::Display for CommandMessage {
+impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, group) in self.parallel.iter().enumerate() {
             if i > 0 {
@@ -117,21 +135,53 @@ impl fmt::Display for CommandMessage {
     }
 }
 
-impl CommandMessage {
+impl Statement {
     pub fn parse(content: &str) -> Self {
         let mut pure = true;
+
+        let trimmed = content.trim_matches('\u{34f}'); // 7tv spam utf tag
+
+        if let Some(rest) = trimmed.strip_prefix("!") {
+            let mut args = split_balanced(rest, &[' ']);
+
+            let name = args.pop_front().unwrap();
+
+            if name.is_empty() {
+                return Self {
+                    original: content.to_owned(),
+                    parallel: vec![vec![]],
+                    pure,
+                };
+            }
+            if !name.contains(':') {
+                let command = Command {
+                    token: Token {
+                        name,
+                        symbol: Symbol::Exclam,
+                    },
+                    params: args.iter().map(|arg| Param::parse(arg)).collect(),
+                };
+                return Self {
+                    original: content.to_owned(),
+                    parallel: vec![vec![command]],
+                    pure,
+                };
+            }
+        }
+
         Self {
-            parallel: split_balanced(content.trim(), &['|', '/']) // allow / for mobile
+            original: content.to_owned(),
+            parallel: split_balanced(trimmed, &['|'])
                 .into_iter()
                 .map(|group| {
                     split_balanced(&group, &[' ', ','])
                         .iter()
                         .filter_map(|s| {
-                            let s = s.trim().trim_matches('\u{e0000}'); // 7tv spam utf tag
+                            let s = s.trim().trim_matches('\u{34f}');
                             if s.is_empty() {
                                 return None;
                             }
-                            let parsed = CommandExpr::parse(s);
+                            let parsed = Command::parse(s);
                             pure &= parsed.is_some();
                             parsed
                         })
@@ -143,72 +193,66 @@ impl CommandMessage {
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub fn is_noop(&self) -> bool {
         self.parallel.iter().all(|seq| seq.is_empty())
     }
 }
 
-fn unwrap_string_literals(input: &str) -> String {
-    let stripped = match input.strip_prefix('"') {
-        Some(tail) => tail.strip_suffix('"'),
-        None => input
-            .strip_prefix('{')
-            .and_then(|tail| tail.strip_suffix('}'))
-            .map(|s| s.trim()),
-    };
-    let Some(input) = stripped else {
-        return input.to_owned();
-    };
-
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\\' => match chars.next() {
-                Some('n') => result.push('\n'),
-                // Some('r') => result.push('\r'), // SSE does not support \r
-                Some('t') => result.push('\t'),
-                Some(ch) => result.push(ch),
-                _ => (),
-            },
-            ch => result.push(ch),
-        }
+impl From<&str> for Statement {
+    fn from(content: &str) -> Self {
+        Self::parse(content)
     }
-    result
 }
 
 // split that considers "string literals"
-fn split_balanced(input: &str, seps: &[char]) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut current = String::new();
+fn split_balanced(input: &str, seps: &[char]) -> VecDeque<CompactString> {
+    let mut result = VecDeque::new();
+    let mut current = CompactString::const_new("");
     let mut in_string = false;
     let mut brace_depth = 0;
     let mut paren_depth = 0;
 
     let mut chars = input.chars();
+
     while let Some(ch) = chars.next() {
         if (in_string || brace_depth != 0) && ch == '\\' {
-            if let Some(ch) = chars.next() {
+            if let Some(ch2) = chars.next() {
                 current.push('\\');
-                current.push(ch);
+                current.push(ch2);
             }
             continue;
         }
         match ch {
             '"' if brace_depth == 0 => in_string = !in_string,
+            '“' if brace_depth == 0 => in_string = !in_string,
+            '”' if brace_depth == 0 => in_string = !in_string,
             '{' if !in_string => brace_depth += 1,
-            '}' if !in_string => brace_depth -= 1,
+            '}' if !in_string && brace_depth > 0 => brace_depth -= 1,
             '(' if !in_string => paren_depth += 1,
-            ')' if !in_string => paren_depth -= 1,
+            ')' if !in_string && paren_depth > 0 => paren_depth -= 1,
             _ => {}
         }
         if !in_string && brace_depth == 0 && paren_depth == 0 && seps.contains(&ch) {
-            result.push(std::mem::take(&mut current));
+            result.push_back(std::mem::take(&mut current));
         } else {
             current.push(ch);
         }
     }
-    result.push(current);
+
+    // If any structure is still open, split the inside as well
+    if in_string || brace_depth != 0 || paren_depth != 0 {
+        let mut part = CompactString::const_new("");
+        for ch in current.chars() {
+            if seps.contains(&ch) {
+                result.push_back(std::mem::take(&mut part));
+            } else {
+                part.push(ch);
+            }
+        }
+        result.push_back(part);
+    } else {
+        result.push_back(current);
+    }
     result
 }
 
@@ -217,85 +261,192 @@ mod tests {
     use super::*;
 
     #[test]
+    fn split_empty_input() {
+        assert_eq!(split_balanced("", &[',']), vec![""]);
+    }
+
+    #[test]
+    fn split_multiple_separators() {
+        assert_eq!(split_balanced("foo,,bar", &[',']), vec!["foo", "", "bar"]);
+    }
+
+    #[test]
+    fn split_only_separators() {
+        assert_eq!(split_balanced(",,", &[',']), vec!["", "", ""]);
+    }
+
+    #[test]
+    fn split_unbalanced_braces() {
+        assert_eq!(split_balanced("{foo,bar", &[',']), vec!["{foo", "bar"]);
+    }
+
+    #[test]
+    fn split_unbalanced_parens() {
+        assert_eq!(
+            split_balanced("foo(bar,baz", &[',']),
+            vec!["foo(bar", "baz"]
+        );
+    }
+
+    #[test]
+    fn split_unclosed_string() {
+        assert_eq!(split_balanced("\"foo,bar", &[',']), vec!["\"foo", "bar"]);
+    }
+
+    #[test]
+    fn split_escaped_quote() {
+        assert_eq!(
+            split_balanced("\"foo\\\",bar\",baz", &[',']),
+            vec!["\"foo\\\",bar\"", "baz"]
+        );
+    }
+
+    #[test]
+    fn split_nested_braces() {
+        assert_eq!(
+            split_balanced("{foo,{bar,baz}},qux", &[',']),
+            vec!["{foo,{bar,baz}}", "qux"]
+        );
+    }
+
+    #[test]
+    fn split_nested_parens() {
+        assert_eq!(
+            split_balanced("(foo,(bar,baz)),qux", &[',']),
+            vec!["(foo,(bar,baz))", "qux"]
+        );
+    }
+
+    #[test]
+    fn split_multiple_different_separators() {
+        assert_eq!(
+            split_balanced("foo|,bar", &['|', ',']),
+            vec!["foo", "", "bar"]
+        );
+    }
+
+    #[test]
+    fn split_escaped_quote_at_end_of_string() {
+        assert_eq!(
+            split_balanced("\"foo\\\"bar\\\"\"", &[',']),
+            vec!["\"foo\\\"bar\\\"\""]
+        );
+    }
+
+    #[test]
+    fn split_escaped_quote_at_start_of_string() {
+        assert_eq!(
+            split_balanced("\"\\\"foo,bar\"", &[',']),
+            vec!["\"\\\"foo,bar\""]
+        );
+    }
+
+    #[test]
     fn parsing() {
         let message = "Hello, this is left~ and right:.3~ and mouse:123:321~ | and then test~ test2~ and ~nope";
-        let parsed = CommandMessage::parse(message);
+        let parsed = Statement::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"left~ right:".3"~ mouse:123:321~ | test~ test2~ nope~"#);
-        // no test2 hah
+        insta::assert_snapshot!(parsed, @"left~ right:{ .3 }~ mouse:123:321~ | test~ test2~ nope~");
     }
 
     #[test]
-    fn cringing() {
+    fn only_symbol_non_command() {
+        assert!(Statement::parse("~").is_noop());
+    }
+
+    #[test]
+    fn only_argument_non_command() {
+        assert!(Statement::parse(":foo~").is_noop());
+    }
+
+    #[test]
+    fn split_inline_number() {
+        let token = Token {
+            name: "foo-123s".into(),
+            symbol: Symbol::None,
+        };
+        let split = token.split_inline_number();
+        assert_eq!(split, Some(("foo", "-123s")));
+    }
+
+    #[test]
+    fn pluses() {
         let message = "Hello, this is +left and +right:.3 and +mouse:123:321 | and then +test +test2 and +wut~";
-        let parsed = CommandMessage::parse(message);
+        let parsed = Statement::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"left~ right:".3"~ mouse:123:321~ | test~ test2~ +wut~"#);
+        insta::assert_snapshot!(parsed, @"left~ right:{ .3 }~ mouse:123:321~ | test~ test2~ +wut~");
     }
 
     #[test]
-    fn normieing() {
+    fn exclams() {
         let message = "Hello, this is !left and !right:.3 and !mouse:123:321 | and then !test !test2 and !wut~";
-        let parsed = CommandMessage::parse(message);
+        let parsed = Statement::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"left~ right:".3"~ mouse:123:321~ | test~ test2~ !wut~"#);
+        insta::assert_snapshot!(parsed, @"left~ right:{ .3 }~ mouse:123:321~ | test~ test2~ !wut~");
     }
 
     #[test]
-    fn neithering() {
+    fn nothings() {
         let message =
             "Hello, this is left and right:.3 and mouse:123:321 | and then test test2 and wut";
-        let parsed = CommandMessage::parse(message);
+        let parsed = Statement::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"right:".3"~ mouse:123:321~"#);
+        insta::assert_snapshot!(parsed, @"right:{ .3 }~ mouse:123:321~");
     }
 
     #[test]
     fn strings() {
         let message = r#"print:"hello space"~ +hah:"and | pipe" | ~nope:123 | and-also-escapes:" \"incredible\", lol"~ "#;
 
-        let parsed = CommandMessage::parse(message);
+        let parsed = Statement::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"print:"hello space"~ hah:"and | pipe"~ | nope:123~ | and-also-escapes:" \"incredible\", lol"~"#);
+        insta::assert_snapshot!(parsed, @r#"print:{ hello space }~ hah:{ and | pipe }~ | nope:123~ | and-also-escapes:{  "incredible", lol }~"#);
     }
 
     #[test]
     fn braces() {
         let message = r#"print:{ hello space }~ +hah:{ and | pipe } | ~nope:123 | and-also-escapes:{  { incredible }, lol }~ "#;
 
-        let parsed = CommandMessage::parse(message);
+        let parsed = Statement::parse(message);
 
-        insta::assert_snapshot!(parsed, @r#"print:"hello space"~ hah:"and | pipe"~ | nope:123~ | and-also-escapes:"{ incredible }, lol"~"#);
+        insta::assert_snapshot!(parsed, @"print:{ hello space }~ hah:{ and | pipe }~ | nope:123~ | and-also-escapes:{ { incredible }, lol }~");
     }
 
     #[test]
     fn pure_cmd() {
-        assert!(CommandMessage::parse("U3s~ | w1s~ l600~").pure);
+        assert!(Statement::parse("U3s~ | w1s~ l600~").pure);
     }
 
     #[test]
     fn seventv_spam_suffix() {
-        assert!(CommandMessage::parse("+lh 󠀀").pure);
+        assert!(Statement::parse("+lh 󠀀").pure);
     }
 
     #[test]
     fn empty_arg() {
-        let parsed = CommandMessage::parse("command::second-arg~");
+        let parsed = Statement::parse("command::second-arg~");
 
-        insta::assert_snapshot!(parsed, @"command::\"second-arg\"~");
+        insta::assert_snapshot!(parsed, @"command::{ second-arg }~");
     }
 
     #[test]
     fn funky() {
-        let parsed = CommandMessage::parse(" test:some-text-with-{ braces and shit }-in-it ");
+        let parsed = Statement::parse(" test:some-text-with-{ braces and shit }-in-it ");
 
-        insta::assert_snapshot!(parsed, @r#"test:"some-text-with-{ braces and shit }-in-it"~"#);
+        insta::assert_snapshot!(parsed, @"test:{ some-text-with-{ braces and shit }-in-it }~");
     }
 
     #[test]
     fn percent_full_arg() {
-        let parsed = CommandMessage::parse(" w:%(1:default) ");
+        let parsed = Statement::parse(" w:%(1:default) ");
 
-        insta::assert_snapshot!(parsed, @r#"w:"%(1:default)"~"#);
+        insta::assert_snapshot!(parsed, @"w:{ %(1:default) }~");
+    }
+
+    #[test]
+    fn url_double_arg() {
+        let parsed = Statement::parse(" sr:https://youtu.be/dQw4w9WgXcQ ");
+
+        insta::assert_snapshot!(parsed, @"sr:https:{ //youtu.be/dQw4w9WgXcQ }~");
     }
 }
