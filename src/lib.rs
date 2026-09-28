@@ -10,6 +10,12 @@ pub mod param;
 
 use param::Param;
 
+/// The chars that Chatterino and the 7TV extension append, after a space, to
+/// a message that is the same as the previous one, to get around the
+/// duplicate message check of Twitch. U+E0000 was used until August 2025,
+/// U+034F is used after that.
+const SPAM_SUFFIX_CHARS: &[char] = &['\u{34f}', '\u{e0000}'];
+
 #[derive(Debug, Clone, Copy)]
 pub enum Symbol {
     SuffixTilde,
@@ -139,10 +145,10 @@ impl Statement {
     pub fn parse(content: &str) -> Self {
         let mut pure = true;
 
-        let trimmed = content.trim_matches('\u{34f}'); // 7tv spam utf tag
+        let trimmed = content.trim_matches(SPAM_SUFFIX_CHARS);
 
         if let Some(rest) = trimmed.strip_prefix("!") {
-            let mut args = split_balanced(rest, &[' ']);
+            let mut args = split_balanced(rest.trim_end(), &[' ']);
 
             let name = args.pop_front().unwrap();
 
@@ -177,7 +183,7 @@ impl Statement {
                     split_balanced(&group, &[' ', ','])
                         .iter()
                         .filter_map(|s| {
-                            let s = s.trim().trim_matches('\u{34f}');
+                            let s = s.trim().trim_matches(SPAM_SUFFIX_CHARS);
                             if s.is_empty() {
                                 return None;
                             }
@@ -418,8 +424,16 @@ mod tests {
     }
 
     #[test]
-    fn seventv_spam_suffix() {
-        assert!(Statement::parse("+lh 󠀀").pure);
+    fn spam_suffix() {
+        for suffix in [" \u{e0000}", " \u{34f}", "\u{e0000}", "\u{34f}"] {
+            let parsed = Statement::parse(&format!("+lh{suffix}"));
+            assert!(parsed.pure, "{suffix:?}");
+            assert_eq!(parsed.to_string(), "lh~", "{suffix:?}");
+
+            let parsed = Statement::parse(&format!("!lh{suffix}"));
+            assert!(parsed.pure, "{suffix:?}");
+            assert_eq!(parsed.to_string(), "lh~", "{suffix:?}");
+        }
     }
 
     #[test]
